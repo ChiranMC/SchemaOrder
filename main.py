@@ -1,13 +1,16 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import Any, Dict, List, Tuple, Optional, Set
-import json, re, heapq
+import json
+import re
 from collections import defaultdict
+from typing import Dict, List, Tuple, Optional, Set
+from pathlib import Path
+import heapq
+import tempfile
 
-app = FastAPI(title="Schema Dependency Analyzer", version="1.1")
+app = FastAPI(title="Schema Dependency Analyzer", version="1.0")
 
-# ----------------- Utility Functions ----------------- #
+# ---------------- Core Utility Functions ---------------- #
 
 def clean_identifier(raw: Optional[str]) -> Optional[str]:
     if raw is None:
@@ -34,7 +37,10 @@ def parse_reference_string(ref: Optional[str]) -> Tuple[Optional[str], List[str]
     column_list = [col.strip().strip('"') for col in columns.split(',') if col.strip()]
     return table, column_list
 
-def load_tables_from_dict(raw_tables: list) -> Dict[str, dict]:
+def load_tables_from_json(schema_path: str) -> Dict[str, dict]:
+    with open(schema_path, 'r', encoding='utf-8') as handle:
+        raw_tables = json.load(handle)
+
     tables: Dict[str, dict] = {}
     for entry in raw_tables:
         name = entry["name"]
@@ -160,8 +166,8 @@ def topological_component_order(
         raise RuntimeError(f"Topological sorting failed for component indices: {missing}")
     return order
 
-def build_output_from_json(raw_tables: list) -> Dict[str, Any]:
-    tables = load_tables_from_dict(raw_tables)
+def build_output(schema_path: str) -> Dict[str, object]:
+    tables = load_tables_from_json(schema_path)
 
     for info in tables.values():
         info["foreign_keys"] = sorted(
@@ -206,19 +212,26 @@ def build_output_from_json(raw_tables: list) -> Dict[str, Any]:
         output["self_referencing_tables"] = self_referencing_tables
     return output
 
-# ----------------- FastAPI Models & Endpoints ----------------- #
-
-class SchemaBody(BaseModel):
-    schema: list  # List of tables (same structure as your JSON file)
+# ---------------- FastAPI Endpoints ---------------- #
 
 @app.get("/")
 def root():
-    return {"message": "Schema Dependency Analyzer API (JSON body version)"}
+    return {"message": "Welcome to the Schema Dependency Analyzer API!"}
 
 @app.post("/analyze")
-def analyze_schema(body: SchemaBody):
+async def analyze_schema(file: UploadFile = File(...)):
+    if not file.filename.endswith(".json"):
+        raise HTTPException(status_code=400, detail="Only .json schema files are supported.")
+    
+    # Save uploaded file temporarily
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
     try:
-        result = build_output_from_json(body.schema)
+        result = build_output(tmp_path)
         return JSONResponse(content=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
