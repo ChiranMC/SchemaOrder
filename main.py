@@ -14,7 +14,7 @@ app = FastAPI(title="Schema Dependency Analyzer", version="1.0")
 # ---------------- Pydantic Models for New Endpoint ---------------- #
 
 class ExtractDependenciesRequest(BaseModel):
-    schema: dict
+    tables: list
     table_name: str
 
 # ---------------- Core Utility Functions ---------------- #
@@ -340,23 +340,25 @@ async def extract_dependencies(request: ExtractDependenciesRequest = Body(...)):
     Extracts a subset schema containing a specific table and all its dependencies.
     
     Input:
-    - schema: The output from /analyze endpoint
+    - tables: The tables array from /analyze endpoint output
     - table_name: Name of the table to extract with its dependencies
     
     Output:
     - A new schema containing only the specified table and all its dependencies
     """
-    schema = request.schema
+    tables = request.tables
     table_name = request.table_name
     
-    # Validate schema structure
-    if "tables" not in schema:
-        raise HTTPException(status_code=400, detail="Invalid schema format. Missing 'tables' key.")
+    # Validate tables structure
+    if not tables or len(tables) == 0:
+        raise HTTPException(status_code=400, detail="Tables array is empty.")
     
     # Build a quick lookup dict
     tables_dict: Dict[str, dict] = {}
-    for table in schema["tables"]:
-        name = table["name"]
+    for table in tables:
+        name = table.get("name")
+        if not name:
+            continue
         tables_dict[name] = {
             "name": name,
             "dependencies": set(table.get("dependencies", [])),
@@ -372,6 +374,9 @@ async def extract_dependencies(request: ExtractDependenciesRequest = Body(...)):
     
     # Collect all dependencies
     relevant_tables = collect_all_dependencies(table_name, tables_dict)
+    
+    # Create a minimal schema object for filtering
+    schema = {"tables": tables}
     
     # Filter and rebuild schema
     try:
