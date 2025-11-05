@@ -1,5 +1,6 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Body
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import json
 import re
 from collections import defaultdict
@@ -9,6 +10,12 @@ import heapq
 import tempfile
 
 app = FastAPI(title="Schema Dependency Analyzer", version="1.0")
+
+# ---------------- Pydantic Models for New Endpoint ---------------- #
+
+class ExtractDependenciesRequest(BaseModel):
+    schema: dict
+    table_name: str
 
 # ---------------- Core Utility Functions ---------------- #
 
@@ -212,6 +219,94 @@ def build_output(schema_path: str) -> Dict[str, object]:
         output["self_referencing_tables"] = self_referencing_tables
     return output
 
+# ---------------- New Functions for Dependency Extraction ---------------- #
+
+def collect_all_dependencies(table_name: str, tables_dict: Dict[str, dict]) -> Set[str]:
+    """
+    Recursively collects all transitive dependencies for a given table.
+    Returns a set of table names including the target table itself.
+    """
+    visited = set()
+    stack = [table_name]
+    
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        
+        if current in tables_dict:
+            for dep in tables_dict[current]["dependencies"]:
+                if dep not in visited:
+                    stack.append(dep)
+    
+    return visited
+
+def filter_schema_by_tables(schema: dict, table_names: Set[str]) -> Dict[str, object]:
+    """
+    Filters the analyzed schema to only include specified tables and recalculates
+    topological order for the subset.
+    """
+    # Filter tables
+    filtered_tables = [
+        table for table in schema["tables"]
+        if table["name"] in table_names
+    ]
+    
+    # Build a table dict for reprocessing
+    tables_dict: Dict[str, dict] = {}
+    for table in filtered_tables:
+        name = table["name"]
+        tables_dict[name] = {
+            "name": name,
+            "primary_keys": set(table.get("primary_keys", [])),
+            "foreign_keys": table.get("foreign_keys", []),
+            "dependencies": set(dep for dep in table.get("dependencies", []) if dep in table_names),
+        }
+    
+    # Recalculate components and topological order
+    components, component_map, self_loops = strongly_connected_components(tables_dict)
+    component_order = topological_component_order(tables_dict, components, component_map)
+    topological_groups = [components[idx] for idx in component_order]
+    topological_order = [table for group in topological_groups for table in group]
+    
+    cycles = [group for group in topological_groups if len(group) > 1]
+    self_referencing_tables = sorted(
+        table for table in topological_order if table in self_loops
+    )
+    
+    # Rebuild result tables with updated component indices
+    result_tables = []
+    for table in filtered_tables:
+        name = table["name"]
+        # Filter dependencies to only include tables in our subset
+        dependencies = [dep for dep in table.get("dependencies", []) if dep in table_names and dep != name]
+        self_deps = [name] if name in table.get("self_dependencies", []) else []
+        
+        result_tables.append({
+            "name": name,
+            "primary_keys": table.get("primary_keys", []),
+            "foreign_keys": table.get("foreign_keys", []),
+            "dependencies": dependencies,
+            "self_dependencies": self_deps,
+            "component": component_map.get(name, 0),
+        })
+    
+    # Build output
+    output = {
+        "tables": result_tables,
+        "topological_groups": topological_groups,
+        "topological_order": topological_order,
+        "source_table": list(table_names)[0] if len(table_names) == 1 else None,
+    }
+    
+    if cycles:
+        output["cycles"] = cycles
+    if self_referencing_tables:
+        output["self_referencing_tables"] = self_referencing_tables
+    
+    return output
+
 # ---------------- FastAPI Endpoints ---------------- #
 
 @app.get("/")
@@ -220,6 +315,9 @@ def root():
 
 @app.post("/analyze")
 async def analyze_schema(file: UploadFile = File(...)):
+    """
+    Analyzes a schema JSON file and returns dependency information.
+    """
     if not file.filename.endswith(".json"):
         raise HTTPException(status_code=400, detail="Only .json schema files are supported.")
     
@@ -235,3 +333,52 @@ async def analyze_schema(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+@app.post("/extract-dependencies")
+async def extract_dependencies(request: ExtractDependenciesRequest = Body(...)):
+    """
+    Extracts a subset schema containing a specific table and all its dependencies.
+    
+    Input:
+    - schema: The output from /analyze endpoint
+    - table_name: Name of the table to extract with its dependencies
+    
+    Output:
+    - A new schema containing only the specified table and all its dependencies
+    """
+    schema = request.schema
+    table_name = request.table_name
+    
+    # Validate schema structure
+    if "tables" not in schema:
+        raise HTTPException(status_code=400, detail="Invalid schema format. Missing 'tables' key.")
+    
+    # Build a quick lookup dict
+    tables_dict: Dict[str, dict] = {}
+    for table in schema["tables"]:
+        name = table["name"]
+        tables_dict[name] = {
+            "name": name,
+            "dependencies": set(table.get("dependencies", [])),
+        }
+    
+    # Check if table exists
+    if table_name not in tables_dict:
+        available_tables = sorted(tables_dict.keys())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Table '{table_name}' not found in schema. Available tables: {available_tables}"
+        )
+    
+    # Collect all dependencies
+    relevant_tables = collect_all_dependencies(table_name, tables_dict)
+    
+    # Filter and rebuild schema
+    try:
+        filtered_schema = filter_schema_by_tables(schema, relevant_tables)
+        filtered_schema["extracted_for"] = table_name
+        filtered_schema["total_tables_extracted"] = len(relevant_tables)
+        
+        return JSONResponse(content=filtered_schema)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing dependencies: {str(e)}")
